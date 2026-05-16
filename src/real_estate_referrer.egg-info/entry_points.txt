@@ -1,0 +1,2 @@
+[console_scripts]
+real-estate-referrer = real_estate_referrer.app:cli
