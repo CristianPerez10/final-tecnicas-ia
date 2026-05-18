@@ -1,5 +1,9 @@
 """Agentes y sub-agentes del pipeline."""
 
+from real_estate_referrer.agents.langchain_llm import (
+    LangChainStructuredLLMClient,
+    create_llm_client,
+)
 from real_estate_referrer.agents.llm_client import (
     EchoLLMClient,
     LLMClient,
@@ -18,6 +22,7 @@ from real_estate_referrer.agents.validation_agent import ValidationAgent
 
 __all__ = [
     "EchoLLMClient",
+    "LangChainStructuredLLMClient",
     "LLMClient",
     "PropertySearchSubAgent",
     "RequirementsAgent",
@@ -26,4 +31,5 @@ __all__ = [
     "SafetyNewsSubAgent",
     "SearchCoordinatorAgent",
     "ValidationAgent",
+    "create_llm_client",
 ]

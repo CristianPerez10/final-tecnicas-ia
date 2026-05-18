@@ -8,35 +8,42 @@ especificación `agente-constructor.md` (Real Estate Referrer / UPB —
 
 ## Arquitectura
 
-Tres agentes principales orquestados por la fachada
-`RealEstateReferrerApp.run(prompt)`:
+Tres agentes principales orquestados con **LangGraph** (`graph/builder.py`).
+La fachada `RealEstateReferrerApp.run(prompt)` compila e invoca un
+`StateGraph` con tres nodos y un bucle condicional de flexibilización:
 
-1. `RequirementsAgent` (agente 1) — texto libre → `UserPropertyRequirements`.
-2. `SearchCoordinatorAgent` (agente 2) — coordina:
+1. `extract_requirements` → `RequirementsAgent` — texto libre →
+   `UserPropertyRequirements`.
+2. `coordinate_search` → `SearchCoordinatorAgent` — coordina:
    - `PropertySearchSubAgent` con conectores (`MetrocuadradoConnector`,
      `FixturesPropertyConnector`).
    - `SafetyNewsSubAgent` con conectores
      (`DuckDuckGoNewsConnector`, `FixturesNewsConnector`).
    - Calcula `final_score = w_match · match_score + w_safety · safety_score`.
-3. `ValidationAgent` (agente 3) — aprueba/rechaza, deduplica y, si nada
-   pasa el umbral, devuelve `relaxed_requirements` (subir `price.max`,
-   bajar `area_sqm.min`, ampliar a barrios vecinos) hasta `max_rounds`.
+3. `validate_candidates` → `ValidationAgent` — aprueba/rechaza, deduplica y,
+   si nada pasa el umbral, relaja requisitos (precio, área, barrios vecinos)
+   y vuelve a `coordinate_search` hasta `max_rounds`.
 
 ```
-texto -> RequirementsAgent -> Coordinator -> Validation -> ranking
-                                ^                |
-                                |---- relax -----|  (hasta max_rounds)
+START -> extract -> coordinate -> validate --(approved)--> END
+                         ^              |
+                         +--(relax)-----+  (hasta max_rounds)
 ```
 
-Las invocaciones de agentes pasan **siempre** por métodos de clase. El
-único punto de entrada público es `RealEstateReferrerApp.run`.
+Cada nodo delega en métodos de las clases de agente existentes. El único
+punto de entrada público sigue siendo `RealEstateReferrerApp.run`.
 
 ## Decisiones de implementación
 
-- **LLMClient** es un `Protocol` (en `agents/llm_client.py`). Se incluyen
-  dos implementaciones determinísticas: `RuleBasedStubLLMClient` (regex en
-  español para el agente 1) y `EchoLLMClient` (tests). Cualquier proveedor
-  real (OpenAI/Anthropic/Ollama) se enchufa implementando ese contrato.
+- **LangGraph** orquesta el pipeline; la lógica de dominio permanece en
+  `agents/` sin reescribir conectores ni scoring.
+- **LLMClient** es un `Protocol` (`agents/llm_client.py`). Implementaciones:
+  - `RuleBasedStubLLMClient` — regex en español (default en tests/CI).
+  - `EchoLLMClient` — respuestas fijas en tests.
+  - `LangChainStructuredLLMClient` — `ChatOpenAI` con salida estructurada
+    Pydantic cuando `LLM_PROVIDER=openai`.
+- **Fábrica** `create_llm_client()` lee `LLM_PROVIDER` del entorno o
+  `--llm-provider` en la CLI.
 - **Conectores reales**: `MetrocuadradoConnector` (scraping HTML) y
   `DuckDuckGoNewsConnector` (búsqueda HTML lite, sin API key). Ambos
   degradan a fixtures si fallan.
@@ -62,7 +69,14 @@ Opciones útiles:
 
 - `--mode {real,fixtures,hybrid}` — fuente de los conectores.
 - `--max-rounds N` — tope del bucle de flexibilización (1–5).
+- `--llm-provider {stub,openai}` — proveedor LLM (default: `LLM_PROVIDER` o `stub`).
 - `--show-log` — imprime el log estructurado del pipeline.
+
+Con OpenAI (requiere `OPENAI_API_KEY` en `.env`):
+
+```bash
+python -m real_estate_referrer "Apto en Laureles..." --mode fixtures --llm-provider openai
+```
 
 ## Uso por API
 
@@ -91,6 +105,8 @@ Los tests cubren:
   HTTP via `respx`, fixtures locales para los stubs.
 - `tests/test_scoring.py` — scoring determinístico del coordinador.
 - `tests/test_validation_flexibility.py` — política de flexibilización.
+- `tests/test_graph.py` — routing LangGraph y estado final.
+- `tests/test_langchain_llm.py` — fábrica LLM y adaptador OpenAI (mock).
 - `tests/test_app_integration.py` — pipeline end-to-end + CLI.
 
 ## Estructura
@@ -98,7 +114,8 @@ Los tests cubren:
 ```
 src/real_estate_referrer/
   models/        # Pydantic v2 — UserPropertyRequirements, PropertyCandidate, ...
-  agents/        # LLMClient + 5 agentes concretos
+  agents/        # LLMClient, LangChain, 5 agentes concretos
+  graph/         # StateGraph LangGraph (state, nodes, builder)
   connectors/    # Metrocuadrado, DuckDuckGo News, fixtures
   prompts/       # 5 archivos versionados (sec 9 de la spec)
   config.py      # SearchConfig + defaults
@@ -113,14 +130,22 @@ pyproject.toml
 
 ## Variables de entorno
 
-Ver `.env.example`. La fachada usa `USER_AGENT` si está definido al construir
-los conectores reales. No se requieren API keys para el modo por defecto.
+Ver `.env.example`. Variables relevantes:
+
+| Variable | Uso |
+|----------|-----|
+| `USER_AGENT` | HTTP en conectores reales |
+| `LLM_PROVIDER` | `stub` (default) o `openai` |
+| `OPENAI_API_KEY` | Obligatoria si `LLM_PROVIDER=openai` |
+| `OPENAI_MODEL` | Modelo OpenAI (default `gpt-4o-mini`) |
+
+Tests y demo local usan `fixtures` + `stub` sin API keys.
 
 ## Riesgos conocidos
 
 - Metrocuadrado puede responder 403 / cambiar selectores. El conector lanza
   `ConnectorError` y el sub-agente degrada a fixtures.
-- El stub LLM cubre frases típicas; para producción enchufa un proveedor real
-  vía `LLMClient`.
+- El stub LLM cubre frases típicas; para producción usa
+  `LLM_PROVIDER=openai` o implementa otro adaptador `LLMClient`.
 - DuckDuckGo News puede cambiar su HTML. Los selectores admiten varias
   variantes; ajusta en `connectors/duckduckgo_news.py` si se rompe.

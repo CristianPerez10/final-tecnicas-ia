@@ -15,11 +15,12 @@ from real_estate_referrer.agents import (
     LLMClient,
     PropertySearchSubAgent,
     RequirementsAgent,
-    RuleBasedStubLLMClient,
     SafetyNewsSubAgent,
     SearchCoordinatorAgent,
     ValidationAgent,
+    create_llm_client,
 )
+from real_estate_referrer.graph import build_referrer_graph, initial_state, state_to_final_response
 from real_estate_referrer.config import SearchConfig
 from real_estate_referrer.connectors import (
     DuckDuckGoNewsConnector,
@@ -31,8 +32,7 @@ from real_estate_referrer.connectors.base import (
     NewsConnector,
     PropertyConnector,
 )
-from real_estate_referrer.models import FinalResponse, ScoredProperty
-from real_estate_referrer.models.requirements import UserPropertyRequirements
+from real_estate_referrer.models import FinalResponse
 
 DEFAULT_FIXTURES_DIR = Path(__file__).resolve().parent.parent.parent / "tests" / "fixtures"
 
@@ -50,7 +50,7 @@ class RealEstateReferrerApp:
         fixtures_dir: Path | None = None,
     ) -> None:
         self._config = config or SearchConfig()
-        self._llm = llm or RuleBasedStubLLMClient()
+        self._llm = llm or create_llm_client()
         self._fixtures_dir = fixtures_dir or DEFAULT_FIXTURES_DIR
         property_conns = list(
             property_connectors or self._default_property_connectors()
@@ -67,54 +67,21 @@ class RealEstateReferrerApp:
             property_sub, safety_sub, config=self._config
         )
         self._validator = ValidationAgent(self._config)
+        self._graph = build_referrer_graph(
+            self._requirements_agent,
+            self._coordinator,
+            self._validator,
+        )
 
     def run(
         self,
         user_prompt: str,
         config: SearchConfig | None = None,
     ) -> FinalResponse:
-        """Ejecuta el pipeline completo con loop de rondas y flex."""
+        """Ejecuta el pipeline completo vía LangGraph (loop de rondas y flex)."""
         cfg = config or self._config
-        log: list[str] = []
-        requirements = self._requirements_agent.extract(user_prompt, cfg)
-        log.append(
-            "requirements_agent: extracción ok "
-            f"(defaults_applied={requirements.defaults_applied})"
-        )
-
-        approved: list[ScoredProperty] = []
-        rounds_used = 0
-        for round_index in range(cfg.max_rounds):
-            rounds_used = round_index + 1
-            log.append(
-                f"coordinator: ronda {round_index + 1}/{cfg.max_rounds}"
-            )
-            scored = self._coordinator.find_and_score(requirements, log=log)
-            validation = self._validator.validate(
-                scored, requirements, round_index=round_index
-            )
-            log.append(
-                "validation: aprobadas "
-                f"{len(validation.approved_properties)} | rechazadas "
-                f"{len(validation.rejected_properties)}"
-            )
-            if validation.approved_properties:
-                approved = validation.approved_properties
-                break
-            if validation.relaxed_requirements is None:
-                break
-            requirements = validation.relaxed_requirements
-            log.append(
-                "validation: aplicando relajaciones "
-                + ", ".join(r.field for r in validation.relaxations_applied)
-            )
-
-        return FinalResponse(
-            requirements=requirements,
-            ranking=approved,
-            rounds=rounds_used,
-            log=log,
-        )
+        final_state = self._graph.invoke(initial_state(user_prompt, cfg))
+        return state_to_final_response(final_state)
 
     def _default_property_connectors(self) -> list[PropertyConnector]:
         connectors: list[PropertyConnector] = []
@@ -183,12 +150,19 @@ def run(
     show_log: bool = typer.Option(
         False, "--show-log", help="Imprimir el log estructurado"
     ),
+    llm_provider: str = typer.Option(
+        None,
+        "--llm-provider",
+        help="Proveedor LLM: stub | openai (default: LLM_PROVIDER o stub)",
+    ),
 ) -> None:
     """Ejecuta el pipeline e imprime un ranking en consola."""
     load_dotenv(override=False)
     user_agent = os.environ.get(
         "USER_AGENT", SearchConfig.model_fields["user_agent"].default
     )
+    if llm_provider:
+        os.environ["LLM_PROVIDER"] = llm_provider
     config = SearchConfig(
         connector_mode=mode,  # type: ignore[arg-type]
         max_rounds=max_rounds,
